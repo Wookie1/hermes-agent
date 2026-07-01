@@ -1140,9 +1140,11 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     Subscription paths:
 
     - **Gateway** (telegram/discord/slack/etc): ``HERMES_SESSION_PLATFORM``
-      and ``HERMES_SESSION_CHAT_ID`` are set in ContextVars by the
+      and ``HERMES_SESSION_CHAT_ID``/``HERMES_SESSION_CHAT_TYPE`` are set in ContextVars by the
       messaging gateway before agent dispatch. The notification poller
-      already keys off these, so we just register a row.
+      already keys off these, so we just register a row. ``chat_type`` is
+      persisted so the later creator wake reconstructs the exact session key
+      shape (DMs use ``:dm:<chat_id>``; groups/threads use different shapes).
 
     - **Session-key fallback**: when the platform/chat_id ContextVars are
       unset (TUI sessions clear them; dispatcher-spawned workers never
@@ -1179,6 +1181,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
+        chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
         if not platform or not chat_id:
             # Fallback: platform/chat_id ContextVars are cleared for TUI
             # sessions and not propagated into dispatcher-spawned worker
@@ -1199,11 +1202,13 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 # CLI / cron / dispatcher-spawned worker — no session route.
                 # Without the configured default route these tasks get NO
                 # subscription, so their blocked/needs-input events are never
-                # delivered to anyone.
+                # delivered to anyone. The configured route is the owner's
+                # direct chat, so the wake session key uses the DM shape.
                 if default_route is None:
                     return False
                 platform, chat_id, key_thread_id = default_route
                 thread_id = thread_id or key_thread_id
+                chat_type = chat_type or "dm"
             else:
                 parsed = _parse_gateway_session_key(session_key)
                 if parsed:
@@ -1212,14 +1217,19 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                     # can deliver. Recording these as platform="tui" produced
                     # permanently undeliverable rows — the notifier only sends
                     # via connected platform adapters, and no TUI poller consumes
-                    # kanban_notify_subs.
+                    # kanban_notify_subs. The key's 4th segment is the chat_type
+                    # (dm/thread/group/channel) — persist it so the creator wake
+                    # reconstructs the exact session key shape.
                     platform, chat_id, key_thread_id = parsed
                     thread_id = thread_id or key_thread_id
+                    _key_parts = session_key.split(":")
+                    chat_type = chat_type or (_key_parts[3] if len(_key_parts) > 3 and _key_parts[3] else None)
                 elif default_route is not None:
                     # Non-gateway session key (genuine TUI/desktop). A "tui" row
                     # is dead bookkeeping — prefer the deliverable default route.
                     platform, chat_id, key_thread_id = default_route
                     thread_id = thread_id or key_thread_id
+                    chat_type = chat_type or "dm"
                 else:
                     platform = "tui"
                     chat_id = session_key
@@ -1243,7 +1253,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         _kb.add_notify_sub(
             conn, task_id=task_id,
             platform=platform, chat_id=chat_id,
-            thread_id=thread_id, user_id=user_id,
+            thread_id=thread_id, user_id=user_id, chat_type=chat_type,
             notifier_profile=notifier_profile,
         )
         return True

@@ -15,6 +15,15 @@ class RecordingAdapter:
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
 
 
+class WakeRecordingAdapter(RecordingAdapter):
+    def __init__(self):
+        super().__init__()
+        self.wake_events = []
+
+    async def handle_message(self, event):
+        self.wake_events.append(event)
+
+
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
 
@@ -119,6 +128,50 @@ def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypa
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+
+
+def test_kanban_notifier_wake_uses_persisted_creator_chat_type(tmp_path, monkeypatch):
+    """Creator wakes must reconstruct the creator's real session shape.
+
+    DMs key as ``:dm:<chat_id>`` while group sessions key as
+    ``:group:<chat_id>:<user_id>``. A hardcoded ``group`` wake would land in a
+    fresh group session for DM-created tasks instead of waking the creator.
+    """
+    db_path = tmp_path / "wake-chat-type.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="wake the creator",
+            assignee="worker",
+            session_id="agent:main:telegram:dm:chat-1",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="dm",
+            user_id="user-1",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = WakeRecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert len(adapter.wake_events) == 1
+    wake_source = adapter.wake_events[0].source
+    assert wake_source.chat_type == "dm"
+    assert wake_source.chat_id == "chat-1"
+    assert wake_source.user_id == "user-1"
 
 
 def test_kanban_db_path_is_test_isolated_from_real_home():
