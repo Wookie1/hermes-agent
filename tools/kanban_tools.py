@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -831,6 +832,14 @@ def _handle_comment(args: dict, **kw) -> str:
         return tool_error(f"kanban_comment: {e}")
 
 
+# Title/body cues that a task exists to review other tasks' output. Used by
+# the parentless-verifier guardrail in _handle_create (warning only).
+_REVIEWY_TITLE_RE = re.compile(
+    r"\b(verif\w*|critic\w*|review\w*|validat\w*|audit\w*|qa|gate)\b",
+    re.IGNORECASE,
+)
+
+
 def _handle_create(args: dict, **kw) -> str:
     """Create a child task. Orchestrator workers use this to fan out.
 
@@ -891,6 +900,23 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
+    # Soft guardrail: a parentless task goes `ready` immediately. When the
+    # title/body reads like a verifier/reviewer, that almost always means
+    # the orchestrator forgot `parents=[...]` and the review will race the
+    # work it is meant to review. Warn (in the tool result, where the model
+    # can self-correct) but never block — parentless review tasks are
+    # legitimate when the reviewed artifact lives outside the board.
+    create_warning = None
+    if not parents and _REVIEWY_TITLE_RE.search(
+        f"{title} {body or ''}"
+    ):
+        create_warning = (
+            "this task looks like a verifier/reviewer but has no parents — "
+            "it becomes `ready` immediately and may run before the work it "
+            "reviews. Pass parents=[<worker task ids>] at creation, add them "
+            "now with kanban_link, or use kanban_swarm for "
+            "worker+verifier+synthesizer patterns."
+        )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -936,11 +962,14 @@ def _handle_create(args: dict, **kw) -> str:
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
-            return _ok(
+            _ok_fields = dict(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
                 subscribed=subscribed,
             )
+            if create_warning:
+                _ok_fields["warning"] = create_warning
+            return _ok(**_ok_fields)
         finally:
             conn.close()
     except ValueError as e:
@@ -948,6 +977,104 @@ def _handle_create(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_create failed")
         return tool_error(f"kanban_create: {e}")
+
+
+def _handle_swarm(args: dict, **kw) -> str:
+    """Create a full swarm graph in one call — correct dependencies baked in.
+
+    Wraps :func:`hermes_cli.kanban_swarm.create_swarm`: parallel workers go
+    ``ready`` immediately, the verifier waits on every worker, and the
+    synthesizer waits on the verifier. Orchestrators should prefer this over
+    hand-rolling ``kanban_create`` chains, where a forgotten ``parents=[...]``
+    lets the verifier run before the work it reviews.
+    """
+    guard = _require_orchestrator_tool("kanban_swarm")
+    if guard:
+        return guard
+    goal = args.get("goal")
+    if not goal or not str(goal).strip():
+        return tool_error("goal is required")
+    verifier_assignee = args.get("verifier_assignee")
+    synthesizer_assignee = args.get("synthesizer_assignee")
+    if not verifier_assignee or not synthesizer_assignee:
+        return tool_error(
+            "verifier_assignee and synthesizer_assignee are required — name "
+            "the profiles that review and synthesize the workers' output"
+        )
+    raw_workers = args.get("workers")
+    if not isinstance(raw_workers, (list, tuple)) or not raw_workers:
+        return tool_error(
+            "workers must be a non-empty list of "
+            '{"profile": ..., "title": ..., "body": ...} objects'
+        )
+    try:
+        from hermes_cli.kanban_swarm import SwarmWorkerSpec, create_swarm
+    except Exception as e:
+        return tool_error(f"kanban_swarm: swarm module unavailable: {e}")
+    specs = []
+    for idx, w in enumerate(raw_workers):
+        if not isinstance(w, dict):
+            return tool_error(f"workers[{idx}] must be an object")
+        profile = (w.get("profile") or "").strip()
+        w_title = (w.get("title") or "").strip()
+        if not profile or not w_title:
+            return tool_error(
+                f"workers[{idx}] needs both 'profile' (assignee) and 'title'"
+            )
+        skills = w.get("skills") or []
+        if isinstance(skills, str):
+            skills = [skills]
+        try:
+            specs.append(SwarmWorkerSpec(
+                profile=profile,
+                title=w_title,
+                body=w.get("body") or "",
+                skills=list(skills),
+                priority=int(w.get("priority") or 0),
+                max_runtime_seconds=(
+                    int(w["max_runtime_seconds"])
+                    if w.get("max_runtime_seconds") is not None else None
+                ),
+            ))
+        except (TypeError, ValueError) as e:
+            return tool_error(f"workers[{idx}]: {e}")
+    board = args.get("board")
+    tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
+    priority = args.get("priority")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            result = create_swarm(
+                conn,
+                goal=str(goal).strip(),
+                workers=specs,
+                verifier_assignee=str(verifier_assignee),
+                synthesizer_assignee=str(synthesizer_assignee),
+                root_title=args.get("root_title"),
+                verifier_title=args.get("verifier_title") or "Verify swarm outputs",
+                synthesizer_title=(
+                    args.get("synthesizer_title") or "Synthesize swarm outputs"
+                ),
+                tenant=tenant,
+                created_by=os.environ.get("HERMES_PROFILE") or "swarm-orchestrator",
+                workspace_kind=args.get("workspace_kind") or "scratch",
+                workspace_path=args.get("workspace_path"),
+                priority=int(priority) if priority is not None else 0,
+                idempotency_key=args.get("idempotency_key"),
+            )
+            # Subscribe the creating session to the verifier and synthesizer —
+            # those are where blocked/needs-input events fire, and the
+            # synthesizer's completion is the swarm's deliverable.
+            subscribed = _maybe_auto_subscribe(conn, result.verifier_id)
+            _maybe_auto_subscribe(conn, result.synthesizer_id)
+            return _ok(subscribed=subscribed, **result.as_dict())
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_swarm: {e}")
+    except Exception as e:
+        logger.exception("kanban_swarm failed")
+        return tool_error(f"kanban_swarm: {e}")
 
 
 def _parse_gateway_session_key(session_key: str) -> "tuple[str, str, str | None] | None":
@@ -1610,6 +1737,81 @@ KANBAN_UNBLOCK_SCHEMA = {
     },
 }
 
+KANBAN_SWARM_SCHEMA = {
+    "name": "kanban_swarm",
+    "description": (
+        "Create a complete Kanban swarm graph in ONE call: parallel workers "
+        "→ verifier (waits for ALL workers) → synthesizer (waits for the "
+        "verifier). Dependencies are baked in — prefer this over hand-rolled "
+        "kanban_create chains for any worker+verifier pattern, where a "
+        "forgotten parents=[...] lets the verifier run before the work it "
+        "reviews. Orchestrator-only. Returns root_id, worker_ids, "
+        "verifier_id, synthesizer_id."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "goal": {
+                "type": "string",
+                "description": "The swarm's overall goal / final outcome.",
+            },
+            "workers": {
+                "type": "array",
+                "description": (
+                    "Parallel worker cards. Each runs independently and "
+                    "immediately."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "profile": {
+                            "type": "string",
+                            "description": "Assignee profile that executes this worker.",
+                        },
+                        "title": {"type": "string"},
+                        "body": {"type": "string"},
+                        "skills": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "priority": {"type": "integer"},
+                        "max_runtime_seconds": {"type": "integer"},
+                    },
+                    "required": ["profile", "title"],
+                },
+            },
+            "verifier_assignee": {
+                "type": "string",
+                "description": (
+                    "Profile that reviews all worker output. Becomes ready "
+                    "only when every worker is done; completes with "
+                    'metadata {"gate": "pass"} or blocks with missing work.'
+                ),
+            },
+            "synthesizer_assignee": {
+                "type": "string",
+                "description": (
+                    "Profile that produces the final deliverable. Becomes "
+                    "ready only after the verifier completes."
+                ),
+            },
+            "root_title": {"type": "string"},
+            "verifier_title": {"type": "string"},
+            "synthesizer_title": {"type": "string"},
+            "tenant": {"type": "string"},
+            "priority": {"type": "integer"},
+            "workspace_kind": {"type": "string"},
+            "workspace_path": {"type": "string"},
+            "idempotency_key": {
+                "type": "string",
+                "description": "Dedup key for the root card (safe retries).",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["goal", "workers", "verifier_assignee", "synthesizer_assignee"],
+    },
+}
+
 KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
@@ -1712,4 +1914,13 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+)
+
+registry.register(
+    name="kanban_swarm",
+    toolset="kanban",
+    schema=KANBAN_SWARM_SCHEMA,
+    handler=_handle_swarm,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🐝",
 )
