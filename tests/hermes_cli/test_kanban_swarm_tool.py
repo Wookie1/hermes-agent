@@ -144,3 +144,25 @@ def test_create_no_warning_on_plain_title(kanban_home):
     }))
     assert "error" not in out, out
     assert "warning" not in out
+
+
+def test_kanban_swarm_is_wired_into_toolset():
+    """A tool that registers but isn't listed in toolsets.py is invisible to
+    the agent. Guard the wiring so kanban_swarm stays exposed."""
+    import toolsets
+
+    flat = getattr(toolsets, "_HERMES_CORE_TOOLS", None) or getattr(
+        toolsets, "HERMES_CORE_TOOLS", None
+    )
+    assert flat is not None and "kanban_swarm" in flat
+
+    kb_tools = None
+    for attr in vars(toolsets).values():
+        if (
+            isinstance(attr, dict)
+            and isinstance(attr.get("kanban"), dict)
+            and "tools" in attr["kanban"]
+        ):
+            kb_tools = attr["kanban"]["tools"]
+            break
+    assert kb_tools is not None and "kanban_swarm" in kb_tools
