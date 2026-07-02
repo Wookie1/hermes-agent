@@ -657,3 +657,229 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     # Only the real file was uploaded.
     assert len(documents_uploaded) == 1
     assert "real.pdf" in documents_uploaded[0]
+
+
+# ---------------------------------------------------------------------------
+# Orphan-profile fallback + session-key subscription decoding
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_notifier_fallback_delivers_orphan_profile_sub(kanban_home):
+    """With kanban.notify_fallback_to_active_profile=true, a subscription
+    stamped with a profile that has no adapter in this gateway is delivered
+    via the active profile's adapter instead of being skipped forever."""
+    import hermes_cli.kanban_db as kb
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="orphan-owned task", assignee="worker1")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat1",
+            notifier_profile="orchestrator-with-no-gateway",
+        )
+        kb.complete_task(conn, tid, result="done")
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_notifier_profile = "jherm"
+
+    fake_adapter = MagicMock()
+
+    async def _send_and_stop(chat_id, msg, metadata=None):
+        runner._running = False
+
+    fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await _orig_sleep(0)
+
+    fake_cfg = {"kanban": {"notify_fallback_to_active_profile": True}}
+    with patch("hermes_cli.config.load_config", return_value=fake_cfg), \
+         patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    fake_adapter.send.assert_called_once()
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert subs == [], "delivered completion should unsubscribe"
+
+
+@pytest.mark.asyncio
+async def test_notifier_fallback_off_preserves_skip(kanban_home):
+    """Default (flag off): orphan-profile subs are skipped, cursor untouched."""
+    import hermes_cli.kanban_db as kb
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="orphan-owned task", assignee="worker1")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat1",
+            notifier_profile="orchestrator-with-no-gateway",
+        )
+        kb.complete_task(conn, tid, result="done")
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_notifier_profile = "jherm"
+
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+    tick_count = 0
+
+    async def _fast_sleep(_):
+        nonlocal tick_count
+        await _orig_sleep(0)
+        tick_count += 1
+        if tick_count >= 3:
+            runner._running = False
+
+    fake_cfg = {"kanban": {"notify_fallback_to_active_profile": False}}
+    with patch("hermes_cli.config.load_config", return_value=fake_cfg), \
+         patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    fake_adapter.send.assert_not_called()
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    assert int(subs[0]["last_event_id"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_notifier_logs_startup_line(kanban_home, caplog):
+    """The watcher announces itself at INFO so silence is diagnosable."""
+    import logging
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_notifier_profile = "jherm"
+
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+    tick_count = 0
+
+    async def _fast_sleep(_):
+        nonlocal tick_count
+        await _orig_sleep(0)
+        tick_count += 1
+        if tick_count >= 2:
+            runner._running = False
+
+    with caplog.at_level(logging.INFO), \
+         patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    assert any(
+        "kanban notifier: started (profile=jherm" in rec.getMessage()
+        for rec in caplog.records
+    ), "expected a startup INFO line from the notifier"
+
+
+def test_parse_gateway_session_key():
+    from tools.kanban_tools import _parse_gateway_session_key as parse
+
+    # thread session: 6th part is the thread id
+    assert parse("agent:main:discord:thread:123:456") == ("discord", "123", "456")
+    # dm without thread suffix
+    assert parse("agent:main:telegram:dm:999") == ("telegram", "999", None)
+    # group: 6th part may be a per-user suffix, NOT a thread id
+    assert parse("agent:main:discord:group:123:u42") == ("discord", "123", None)
+    # profile-namespaced key (multiplexing)
+    assert parse("agent:coder:slack:dm:C1:T1") == ("slack", "C1", "T1")
+    # non-gateway keys
+    assert parse("") is None
+    assert parse("desktop-session-abc") is None
+    assert parse("agent:main:discord") is None
+
+
+def test_auto_subscribe_decodes_gateway_session_key(kanban_home, monkeypatch):
+    """A worker subprocess that only inherits HERMES_SESSION_KEY gets a
+    REAL platform/chat subscription, not an undeliverable 'tui' row."""
+    import hermes_cli.kanban_db as kb
+    from tools.kanban_tools import _maybe_auto_subscribe
+
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_KEY", "agent:main:discord:thread:123:456")
+    monkeypatch.setenv("HERMES_PROFILE", "dirk")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="sub-decode task", assignee="worker1")
+        assert _maybe_auto_subscribe(conn, tid) is True
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "discord"
+    assert subs[0]["chat_id"] == "123"
+    assert subs[0]["thread_id"] == "456"
+
+
+def test_auto_subscribe_honors_notifier_profile_config(kanban_home, monkeypatch):
+    """kanban.notifier_profile pins delivery ownership regardless of the
+    creating session's profile."""
+    import hermes_cli.kanban_db as kb
+    import tools.kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_KEY", "agent:main:telegram:dm:777")
+    monkeypatch.setenv("HERMES_PROFILE", "dirk")
+
+    fake_cfg = {"kanban": {"notifier_profile": "jherm"}}
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="profile-pin task", assignee="worker1")
+        with patch.object(kt, "load_config", return_value=fake_cfg):
+            assert kt._maybe_auto_subscribe(conn, tid) is True
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+
+    assert len(subs) == 1
+    assert subs[0]["notifier_profile"] == "jherm"

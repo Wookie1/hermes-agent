@@ -155,6 +155,17 @@ class GatewayKanbanWatchersMixin:
                 "kanban notifier: disabled via config kanban.dispatch_in_gateway=false"
             )
             return
+        # Opt-in single-gateway rescue: deliver subscriptions stamped with a
+        # profile that has no adapter registered in THIS gateway, as long as
+        # the platform itself is connected here. Off by default because in a
+        # multi-gateway deployment the owning profile's gateway is a separate
+        # process this one cannot see, and delivering on its behalf would be
+        # the cross-profile mis-delivery the profile check exists to prevent.
+        # On a single-gateway host, skipping such subs means they can NEVER
+        # deliver (nothing else will pick them up).
+        notify_fallback = bool(
+            kanban_cfg.get("notify_fallback_to_active_profile", False)
+        )
         from gateway.config import Platform as _Platform
         try:
             from hermes_cli import kanban_db as _kb
@@ -270,7 +281,21 @@ class GatewayKanbanWatchersMixin:
                                 owner_profile = sub.get("notifier_profile") or None
                                 if owner_profile and owner_profile != notifier_profile:
                                     _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
-                                    if not _owner_adapters:
+                                    if not _owner_adapters and notify_fallback and (
+                                        (sub.get("platform") or "").lower() in active_platforms
+                                    ):
+                                        # Single-gateway rescue (see flag above):
+                                        # the delivery phase resolves the adapter
+                                        # via _authorization_adapter, which already
+                                        # falls back to this gateway's own adapter
+                                        # when the stamped profile has no registry
+                                        # entry — so collection is the only gate.
+                                        logger.debug(
+                                            "kanban notifier: delivering sub for %s owned by "
+                                            "profile %s via active profile %s (fallback enabled)",
+                                            sub.get("task_id"), owner_profile, notifier_profile,
+                                        )
+                                    elif not _owner_adapters:
                                         _warn_key = ("profile", owner_profile)
                                         if _warn_key not in skip_warned:
                                             skip_warned.add(_warn_key)
