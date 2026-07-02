@@ -190,6 +190,21 @@ class GatewayKanbanWatchersMixin:
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
             self._kanban_notifier_profile = notifier_profile
+        # One INFO line at startup so "no notifications" is diagnosable from
+        # the log: every disabled branch above logs, but the happy path used
+        # to be silent (all per-tick logs are DEBUG), which made a watcher
+        # that runs-but-skips-everything indistinguishable from one that
+        # never started.
+        logger.info(
+            "kanban notifier: started (profile=%s, interval=%ss)",
+            notifier_profile,
+            interval,
+        )
+        # Rate-limit undeliverable-subscription warnings: one WARNING per
+        # (reason, key) per process, so a permanently mis-owned or
+        # mis-platformed sub is surfaced once instead of every 5s tick.
+        skip_warned: set[tuple] = getattr(self, "_kanban_skip_warned", set())
+        self._kanban_skip_warned = skip_warned
 
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
@@ -256,6 +271,15 @@ class GatewayKanbanWatchersMixin:
                                 if owner_profile and owner_profile != notifier_profile:
                                     _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
                                     if not _owner_adapters:
+                                        _warn_key = ("profile", owner_profile)
+                                        if _warn_key not in skip_warned:
+                                            skip_warned.add(_warn_key)
+                                            logger.warning(
+                                                "kanban notifier: subscription(s) owned by profile %s "
+                                                "(e.g. task %s on board %s) have no adapter in this "
+                                                "gateway (profile %s) and will never deliver",
+                                                owner_profile, sub.get("task_id"), slug, notifier_profile,
+                                            )
                                         logger.debug(
                                             "kanban notifier: subscription for %s owned by profile %s; current profile %s has no adapter for it, skipping",
                                             sub.get("task_id"), owner_profile, notifier_profile,
@@ -263,6 +287,16 @@ class GatewayKanbanWatchersMixin:
                                         continue
                                 platform = (sub.get("platform") or "").lower()
                                 if platform not in active_platforms:
+                                    _warn_key = ("platform", platform)
+                                    if _warn_key not in skip_warned:
+                                        skip_warned.add(_warn_key)
+                                        logger.warning(
+                                            "kanban notifier: subscription(s) on platform %r "
+                                            "(e.g. task %s on board %s) cannot deliver while no "
+                                            "adapter for that platform is connected (active: %s)",
+                                            platform or "<missing>", sub.get("task_id"), slug,
+                                            ", ".join(sorted(active_platforms)),
+                                        )
                                     logger.debug(
                                         "kanban notifier: subscription for %s on %s skipped; adapter not connected",
                                         sub.get("task_id"), platform or "<missing>",

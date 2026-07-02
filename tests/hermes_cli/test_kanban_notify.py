@@ -657,3 +657,42 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     # Only the real file was uploaded.
     assert len(documents_uploaded) == 1
     assert "real.pdf" in documents_uploaded[0]
+
+
+@pytest.mark.asyncio
+async def test_notifier_logs_startup_line(kanban_home, caplog):
+    """The watcher announces itself at INFO so silence is diagnosable."""
+    import logging
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_notifier_profile = "jherm"
+
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+    tick_count = 0
+
+    async def _fast_sleep(_):
+        nonlocal tick_count
+        await _orig_sleep(0)
+        tick_count += 1
+        if tick_count >= 2:
+            runner._running = False
+
+    with caplog.at_level(logging.INFO), \
+         patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    assert any(
+        "kanban notifier: started (profile=jherm" in rec.getMessage()
+        for rec in caplog.records
+    ), "expected a startup INFO line from the notifier"
