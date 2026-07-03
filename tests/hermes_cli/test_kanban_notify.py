@@ -883,3 +883,62 @@ def test_auto_subscribe_honors_notifier_profile_config(kanban_home, monkeypatch)
 
     assert len(subs) == 1
     assert subs[0]["notifier_profile"] == "jherm"
+
+
+def test_auto_subscribe_default_route_for_sessionless_creators(kanban_home, monkeypatch):
+    """Dispatcher-spawned workers have no session ContextVars and no
+    HERMES_SESSION_KEY; without kanban.notify_default_route their tasks get
+    NO subscription and blocked events are never delivered to anyone."""
+    import hermes_cli.kanban_db as kb
+    import tools.kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+
+    conn = kb.connect()
+    try:
+        # Without the config: sessionless creation stays a no-op (upstream default).
+        t1 = kb.create_task(conn, title="no-route task", assignee="w")
+        assert kt._maybe_auto_subscribe(conn, t1) is False
+        assert kb.list_notify_subs(conn, t1) == []
+
+        # With the config: subscribe to the default route.
+        fake_cfg = {"kanban": {"notify_default_route": "telegram:12345",
+                               "notifier_profile": "jherm"}}
+        t2 = kb.create_task(conn, title="routed task", assignee="w")
+        with patch.object(kt, "load_config", return_value=fake_cfg):
+            assert kt._maybe_auto_subscribe(conn, t2) is True
+        subs = kb.list_notify_subs(conn, t2)
+    finally:
+        conn.close()
+
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "12345"
+    assert subs[0]["notifier_profile"] == "jherm"
+
+
+def test_auto_subscribe_default_route_replaces_dead_tui_row(kanban_home, monkeypatch):
+    """A non-gateway session key would produce an undeliverable 'tui' row;
+    prefer the configured default route instead."""
+    import hermes_cli.kanban_db as kb
+    import tools.kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_KEY", "desktop-session-abc")
+
+    fake_cfg = {"kanban": {"notify_default_route": "discord:999:777"}}
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="tui-fallback task", assignee="w")
+        with patch.object(kt, "load_config", return_value=fake_cfg):
+            assert kt._maybe_auto_subscribe(conn, tid) is True
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+
+    assert subs[0]["platform"] == "discord"
+    assert subs[0]["chat_id"] == "999"
+    assert subs[0]["thread_id"] == "777"

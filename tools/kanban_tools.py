@@ -1101,6 +1101,28 @@ def _parse_gateway_session_key(session_key: str) -> "tuple[str, str, str | None]
     return platform, chat_id, thread_id
 
 
+def _default_notify_route(cfg: Any) -> "tuple[str, str, str | None] | None":
+    """Resolve ``kanban.notify_default_route`` into (platform, chat_id, thread_id).
+
+    Format: ``platform:chat_id`` or ``platform:chat_id:thread_id`` (e.g.
+    ``telegram:8656703416``). Unset/malformed → None. This is the safety net
+    for task-creation contexts with no session route at all —
+    dispatcher-spawned workers have no session ContextVars and no
+    ``HERMES_SESSION_KEY``, so without it their tasks get NO subscription and
+    blocked/needs-input events are never delivered to anyone.
+    """
+    try:
+        raw = (cfg_get(cfg, "kanban", "notify_default_route", default="") or "").strip() if cfg else ""
+    except Exception:
+        return None
+    if not raw:
+        return None
+    parts = raw.split(":")
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        return None
+    return parts[0], parts[1], (parts[2] if len(parts) > 2 and parts[2] else None)
+
+
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     """Auto-subscribe the calling session to task completion / block events.
 
@@ -1172,21 +1194,35 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 get_session_env("HERMES_SESSION_KEY", "")
                 or os.environ.get("HERMES_SESSION_KEY", "")
             )
+            default_route = _default_notify_route(cfg)
             if not session_key:
-                return False  # CLI / cron / test — no persistent channel
-            parsed = _parse_gateway_session_key(session_key)
-            if parsed:
-                # Gateway session key (agent:<ns>:<platform>:<chat_type>:...):
-                # subscribe to the REAL platform/chat so the gateway notifier
-                # can deliver. Recording these as platform="tui" produced
-                # permanently undeliverable rows — the notifier only sends
-                # via connected platform adapters, and no TUI poller consumes
-                # kanban_notify_subs.
-                platform, chat_id, key_thread_id = parsed
+                # CLI / cron / dispatcher-spawned worker — no session route.
+                # Without the configured default route these tasks get NO
+                # subscription, so their blocked/needs-input events are never
+                # delivered to anyone.
+                if default_route is None:
+                    return False
+                platform, chat_id, key_thread_id = default_route
                 thread_id = thread_id or key_thread_id
             else:
-                platform = "tui"
-                chat_id = session_key
+                parsed = _parse_gateway_session_key(session_key)
+                if parsed:
+                    # Gateway session key (agent:<ns>:<platform>:<chat_type>:...):
+                    # subscribe to the REAL platform/chat so the gateway notifier
+                    # can deliver. Recording these as platform="tui" produced
+                    # permanently undeliverable rows — the notifier only sends
+                    # via connected platform adapters, and no TUI poller consumes
+                    # kanban_notify_subs.
+                    platform, chat_id, key_thread_id = parsed
+                    thread_id = thread_id or key_thread_id
+                elif default_route is not None:
+                    # Non-gateway session key (genuine TUI/desktop). A "tui" row
+                    # is dead bookkeeping — prefer the deliverable default route.
+                    platform, chat_id, key_thread_id = default_route
+                    thread_id = thread_id or key_thread_id
+                else:
+                    platform = "tui"
+                    chat_id = session_key
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         # `kanban.notifier_profile` pins which gateway profile delivers
         # kanban notifications. Without it, subs are stamped with the
